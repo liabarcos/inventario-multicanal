@@ -15,6 +15,21 @@ Además incluye un **panel multicanal** (`/multicanal`) que muestra los producto
 
 - **Repositorio:** https://github.com/liabarcos/inventario-multicanal
 
+### Contenido
+
+1. [Arquitectura](#-arquitectura)
+2. [Entorno utilizado](#️-entorno-utilizado)
+3. [Instalación y ejecución](#-instalación-y-ejecución)
+4. [API REST](#-api-rest)
+5. [GraphQL](#-graphql)
+6. [WebSockets con Reverb](#-websockets-con-reverb)
+7. [gRPC](#-grpc)
+8. [Panel multicanal](#-panel-multicanal)
+9. [Capturas](#-capturas)
+10. [Tests](#-tests)
+11. [Seguridad](#-seguridad)
+12. [Solución de problemas](#-solución-de-problemas)
+
 ---
 
 ## 🧠 Arquitectura
@@ -42,6 +57,17 @@ gRPC      ─┘                                                     │
 | Evento | `app/Events/ProductoActualizado.php` | Broadcast por Reverb. |
 | gRPC | `grpc/producto.proto`, `grpc/server.cjs`, `grpc/client.cjs` | Contrato, servidor y cliente Node. |
 | Vistas | `resources/views/multicanal.blade.php`, `resources/views/inventario.blade.php` | Panel propio y vista de la guía. |
+
+### Flujo de una actualización
+
+1. Llega una petición por **REST** o **GraphQL**.
+2. El controlador o el resolver delega en **`ProductoService`**.
+3. El servicio valida y guarda con **Eloquent**.
+4. Se dispara **`ProductoActualizado`** con el producto y la acción (`creado` / `actualizado`).
+5. La **cola** toma el evento y **Reverb** lo publica en el canal `inventario`.
+6. Todos los navegadores suscritos actualizan la tabla sin recargar.
+
+Si el cambio llega por **gRPC**, en realidad es una **lectura**: el servidor Node consulta el endpoint interno protegido y devuelve el producto por Protobuf, sin escribir en la base.
 
 ---
 
@@ -74,7 +100,7 @@ cd inventario-multicanal
 composer install
 Copy-Item .env.example .env
 php artisan key:generate
-php artisan migrate --seed
+php artisan migrate
 php artisan db:seed --class=ProductoSeeder   # datos de ejemplo
 npm install
 ```
@@ -83,7 +109,8 @@ Si el archivo `database/database.sqlite` no existe:
 
 ```powershell
 New-Item database/database.sqlite -ItemType File
-php artisan migrate --seed
+php artisan migrate
+php artisan db:seed --class=ProductoSeeder
 ```
 
 ### 2. Levantar los procesos
@@ -142,6 +169,28 @@ curl.exe -i -X DELETE http://127.0.0.1:8002/api/productos/1
 ```
 
 > Para ver el JSON con sangría durante una demostración: `GET /api/productos?pretty=1`.
+
+---
+
+## 🧭 Decisiones de diseño
+
+| Decisión | Por qué |
+|---|---|
+| **Un solo `ProductoService`** | Evita que REST, GraphQL y gRPC validen o guarden distinto. Si cambia una regla, cambia una vez. |
+| **Evento + cola para el broadcast** | La respuesta HTTP no espera a que se difunda el cambio; el usuario recibe rápido y la cola se encarga del WebSocket. |
+| **GraphQL con Lighthouse** | Aprovecha `@all` y `@find` para las lecturas y resolvers propios para las mutaciones, reutilizando el servicio. |
+| **gRPC de solo lectura** | Demuestra el canal con un contrato Protobuf sin duplicar la escritura. El servidor Node no toca la base: pasa por el endpoint interno. |
+| **Clave compartida en el endpoint interno** | El puerto de Laravel queda protegido incluso si alguien descubre la ruta; se compara con `hash_equals`. |
+| **Puente HTTP en el servidor gRPC** | El navegador no habla gRPC nativo. El puente recibe HTTP y por dentro crea un cliente gRPC real, así el panel puede demostrar el canal. |
+| **SQLite** | Hace el trabajo portable: no requiere instalar un motor de base de datos. |
+| **Panel propio** | Reúne los cuatro canales en una pantalla y sirve como evidencia visual para la entrega. |
+
+**Limitaciones conocidas (y qué haría en producción):**
+
+- El canal de WebSocket es **público**: en producción usaría canales privados con autenticación.
+- El stock se asigna como **valor absoluto**: dos cambios simultáneos pueden pisarse; en producción usaría transacciones y `stock = stock + 1` atómico.
+- gRPC viaja **sin TLS** y el endpoint interno usa una clave de laboratorio: en producción iría TLS, red privada y `config()` en lugar de `env()`.
+- La API REST no tiene autenticación: en producción iría con Sanctum y rate limiting.
 
 ---
 
@@ -361,7 +410,7 @@ PASS  Tests\Feature\ProductoInternoTest
 PASS  Tests\Feature\ProductoRestTest
 
 Tests:    20 passed (49 assertions)
-Duration: 2.12s
+Duration: 2.29s
 ```
 
 Cubren:
@@ -413,6 +462,22 @@ tests/Feature/
 └── ProductoEventoTest.php
 docs/capturas/            # capturas para la entrega
 ```
+
+---
+
+## 🧯 Solución de problemas
+
+| Síntoma | Causa probable | Solución |
+|---|---|---|
+| El panel queda en “Conectando a Reverb…” | Reverb no está corriendo o el puerto no coincide. | Ejecutar `php artisan reverb:start --host=127.0.0.1 --port=8082` y revisar `REVERB_PORT` / `VITE_REVERB_PORT`. |
+| Los cambios se guardan pero no llegan por WebSocket | La cola no está procesando. | Ejecutar `php artisan queue:work` y verificar `BROADCAST_CONNECTION=reverb`. |
+| Error de “Vite manifest not found” | No se compiló el frontend. | `npm run dev` (desarrollo) o `npm run build`. |
+| gRPC responde “El servidor no está disponible” | `server.cjs` no está corriendo. | `cd grpc` + `$env:GRPC_INTERNAL_KEY='clave-local-larga-de-prueba'` + `node server.cjs`. |
+| gRPC devuelve 403 | La clave del servidor Node no coincide con la de Laravel. | Usar el mismo `GRPC_INTERNAL_KEY` en `.env` y en la variable de entorno de Node. |
+| gRPC devuelve error 500 | Laravel no está en el puerto 8002 o el producto no existe. | Verificar `php artisan serve --port=8002` y que el ID exista. |
+| GraphQL dice “Cannot query field” | El schema cambió y quedó caché. | `php artisan lighthouse:clear-cache`. |
+| Un puerto está ocupado | Otro proceso lo está usando. | Cambiar el puerto en `.env` (`APP_URL`, `REVERB_*`) y en `grpc/server.cjs`, o cerrar el proceso. |
+| Los cambios de `.env` no se aplican | Configuración cacheada. | `php artisan optimize:clear`. |
 
 ---
 
